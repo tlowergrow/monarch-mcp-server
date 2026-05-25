@@ -110,6 +110,83 @@ async def _update_transaction_drawer(client, transaction_id: str, **fields: Any)
         variables=variables,
         graphql_query=_DRAWER_UPDATE_MUTATION,
     )
+
+
+# Raw query for get_transactions with the `needsReview` filter applied at the
+# API level. Library 1.3.0 does not expose `needs_review` as a `get_transactions`
+# kwarg; library 1.3.2 added it. Rather than depend on a specific library
+# version, the MCP sends the query directly. Returns the same response shape as
+# the library's `get_transactions` so calling code is unchanged.
+# Verified 2026-05-25 via live API test that `needsReview` is a valid filter
+# input on `TransactionFilterInput`.
+_NEEDS_REVIEW_TRANSACTIONS_QUERY = gql(
+    """
+    query GetTransactionsList($offset: Int, $limit: Int, $filters: TransactionFilterInput, $orderBy: TransactionOrdering) {
+        allTransactions(filters: $filters) {
+            totalCount
+            results(offset: $offset, limit: $limit, orderBy: $orderBy) {
+                id
+                ...TransactionOverviewFields
+                __typename
+            }
+            __typename
+        }
+        transactionRules {
+            id
+            __typename
+        }
+    }
+
+    fragment TransactionOverviewFields on Transaction {
+        id
+        amount
+        pending
+        date
+        hideFromReports
+        plaidName
+        notes
+        isRecurring
+        reviewStatus
+        needsReview
+        attachments {
+            id
+            extension
+            filename
+            originalAssetUrl
+            publicId
+            sizeBytes
+            __typename
+        }
+        isSplitTransaction
+        createdAt
+        updatedAt
+        category {
+            id
+            name
+            __typename
+        }
+        merchant {
+            name
+            id
+            transactionsCount
+            __typename
+        }
+        account {
+            id
+            displayName
+            __typename
+        }
+        tags {
+            id
+            name
+            color
+            order
+            __typename
+        }
+        __typename
+    }
+    """
+)
 # --- END PATCH ---
 
 KNOWN_CURRENCY_CODES = {
@@ -1111,29 +1188,42 @@ async def get_transactions_needing_review(
     try:
         client = await get_monarch_client()
 
-        filters: Dict[str, Any] = {"limit": limit}
-
-        # PATCH: pass needs_review to the API filter, not just client-side.
-        # Without this, the tool fetches the most recent `limit` transactions
-        # account-wide and then filters them locally, which returns an empty
-        # list when the recent transactions are all already-reviewed — even if
-        # older transactions in the account still need review.
+        # PATCH: send the query directly with the `needsReview` filter applied
+        # at the API level. The upstream library's `get_transactions` doesn't
+        # expose this filter consistently across versions (1.3.0 lacks it,
+        # 1.3.2 added it). Sending the GraphQL query directly via gql_call makes
+        # the MCP independent of the library version. Without filtering at the
+        # API level, the tool would fetch the most recent `limit` transactions
+        # account-wide and locally filter — which returned `[]` whenever the
+        # recent slice happened to be all already-reviewed.
+        gql_filters: Dict[str, Any] = {
+            "search": "",
+            "categories": [],
+            "accounts": [],
+            "tags": [],
+        }
         if needs_review:
-            filters["needs_review"] = True
-
+            gql_filters["needsReview"] = True
+        if account_id:
+            gql_filters["accounts"] = [account_id]
+        if without_notes_only:
+            gql_filters["hasNotes"] = False
         if days:
             end = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-            filters["start_date"] = start
-            filters["end_date"] = end
+            gql_filters["startDate"] = start
+            gql_filters["endDate"] = end
 
-        if account_id:
-            filters["account_ids"] = [account_id]
-
-        if without_notes_only:
-            filters["has_notes"] = False
-
-        transactions_data = await client.get_transactions(**filters)
+        transactions_data = await client.gql_call(
+            operation="GetTransactionsList",
+            variables={
+                "offset": 0,
+                "limit": limit,
+                "orderBy": "date",
+                "filters": gql_filters,
+            },
+            graphql_query=_NEEDS_REVIEW_TRANSACTIONS_QUERY,
+        )
 
         transaction_list = []
         for txn in transactions_data.get("allTransactions", {}).get("results", []):
