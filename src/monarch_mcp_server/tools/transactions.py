@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional
 
+from gql import gql
+
 from monarch_mcp_server.app import mcp
 from monarch_mcp_server.client import get_monarch_client
 from monarch_mcp_server.helpers import (
@@ -21,6 +23,94 @@ from monarch_mcp_server.helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# --- BEGIN PATCH: mark-reviewed via `reviewed` field ---
+# The upstream `monarchmoneycommunity` library's `update_transaction` only sets
+# the `needsReview` input field. The Monarch web UI uses a different field —
+# `reviewed: true` — to atomically (a) flip needsReview to false, (b) set
+# reviewedAt to the current time, and (c) set reviewedByUser to the current
+# user. Without setting `reviewed: true`, the Monarch UI continues to show the
+# transaction as needing review even though `needsReview` is false.
+#
+# This helper sends the same mutation as the UI's transaction drawer, accepting
+# any subset of supported input fields. It is used by `mark_transaction_reviewed`,
+# `bulk_categorize_transactions` (when mark_reviewed=True), and `update_transaction`
+# (when needs_review is False, which the upstream library translates incorrectly).
+#
+# Verified 2026-05-25 by capturing the UI's GraphQL request and replaying it.
+_DRAWER_UPDATE_MUTATION = gql(
+    """
+    mutation Web_TransactionDrawerUpdateTransaction($input: UpdateTransactionMutationInput!) {
+        updateTransaction(input: $input) {
+            transaction {
+                id
+                amount
+                pending
+                date
+                hideFromReports
+                needsReview
+                reviewedAt
+                reviewedByUser {
+                    id
+                    name
+                    __typename
+                }
+                plaidName
+                notes
+                isRecurring
+                category {
+                    id
+                    __typename
+                }
+                goal {
+                    id
+                    __typename
+                }
+                merchant {
+                    id
+                    name
+                    __typename
+                }
+                __typename
+            }
+            errors {
+                ...PayloadErrorFields
+                __typename
+            }
+            __typename
+        }
+    }
+
+    fragment PayloadErrorFields on PayloadError {
+        fieldErrors {
+            field
+            messages
+            __typename
+        }
+        message
+        code
+        __typename
+    }
+    """
+)
+
+
+async def _update_transaction_drawer(client, transaction_id: str, **fields: Any) -> Dict[str, Any]:
+    """Send the Web_TransactionDrawerUpdateTransaction mutation directly.
+
+    Use this for any update that needs the `reviewed` field (which the upstream
+    library does not expose). Accepts any subset of input fields supported by
+    UpdateTransactionMutationInput, e.g. `category`, `name`, `amount`, `date`,
+    `hideFromReports`, `needsReview`, `reviewed`, `goalId`, `notes`.
+    """
+    variables = {"input": {"id": transaction_id, **fields}}
+    return await client.gql_call(
+        operation="Web_TransactionDrawerUpdateTransaction",
+        variables=variables,
+        graphql_query=_DRAWER_UPDATE_MUTATION,
+    )
+# --- END PATCH ---
 
 KNOWN_CURRENCY_CODES = {
     "AED",
@@ -714,7 +804,32 @@ async def update_transaction(
         if notes is not None:
             update_data["notes"] = notes
 
-        result = await client.update_transaction(**update_data)
+        # PATCH: when the caller wants to mark a transaction as reviewed
+        # (needs_review=False), route through _update_transaction_drawer so the
+        # `reviewed: true` field is sent — the upstream library only sends
+        # `needsReview: false`, which doesn't populate reviewedAt/reviewedByUser.
+        if needs_review is False:
+            fields: Dict[str, Any] = {}
+            if category_id is not None:
+                fields["category"] = category_id
+            if merchant_name is not None:
+                fields["name"] = merchant_name
+            if goal_id is not None:
+                fields["goalId"] = goal_id
+            if amount:
+                fields["amount"] = amount
+            if date:
+                fields["date"] = date
+            if hide_from_reports is not None:
+                fields["hideFromReports"] = bool(hide_from_reports)
+            if notes is not None:
+                fields["notes"] = notes
+            fields["reviewed"] = True
+            result = await _update_transaction_drawer(
+                client, transaction_id, **fields
+            )
+        else:
+            result = await client.update_transaction(**update_data)
         return json_success(result)
     except Exception as e:
         return json_error("update_transaction", e)
@@ -791,9 +906,11 @@ async def mark_transaction_reviewed(transaction_id: str) -> str:
     """
     try:
         client = await get_monarch_client()
-        result = await client.update_transaction(
-            transaction_id=transaction_id,
-            needs_review=False,
+        # PATCH: send `reviewed: true` (not `needsReview: false`) so the server
+        # populates reviewedAt and reviewedByUser. See _update_transaction_drawer
+        # docstring at the top of this file for background.
+        result = await _update_transaction_drawer(
+            client, transaction_id, reviewed=True
         )
         return json_success(result)
     except Exception as e:
@@ -843,13 +960,16 @@ async def bulk_categorize_transactions(
         }
 
         async def _update_one(txn_id: str) -> None:
-            update_params: Dict[str, Any] = {
-                "transaction_id": txn_id,
-                "category_id": category_id,
-            }
             if mark_reviewed:
-                update_params["needs_review"] = False
-            await client.update_transaction(**update_params)
+                # PATCH: combined { category, reviewed: true } in one mutation
+                # so reviewedAt and reviewedByUser get populated server-side.
+                await _update_transaction_drawer(
+                    client, txn_id, category=category_id, reviewed=True
+                )
+            else:
+                await client.update_transaction(
+                    transaction_id=txn_id, category_id=category_id
+                )
 
         # Use asyncio.gather for concurrent updates
         tasks = [_update_one(txn_id) for txn_id in transaction_ids]
