@@ -1113,6 +1113,14 @@ async def get_transactions_needing_review(
 
         filters: Dict[str, Any] = {"limit": limit}
 
+        # PATCH: pass needs_review to the API filter, not just client-side.
+        # Without this, the tool fetches the most recent `limit` transactions
+        # account-wide and then filters them locally, which returns an empty
+        # list when the recent transactions are all already-reviewed — even if
+        # older transactions in the account still need review.
+        if needs_review:
+            filters["needs_review"] = True
+
         if days:
             end = datetime.now().strftime("%Y-%m-%d")
             start = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
